@@ -54,8 +54,6 @@ webS/server.mjs
 
 ## Screenshots
 
-> If the images below don't render on your viewer, use the links under them.
-
 ![Screenshot 1](assets/screenshots/not-so-working-map.png)
 
 ![Screenshot 2](assets/screenshots/working-map.png)
