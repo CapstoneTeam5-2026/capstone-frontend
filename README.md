@@ -1,6 +1,6 @@
 # Capstone Frontend
 
-A Next.js frontend with a real-time Leaflet map that tracks trains over India via WebSocket updates.
+A Next.js frontend with a real time Leaflet map that tracks trains over India via WebSocket updates.
 
 ## Stack
 - Next.js (App Router) + React
@@ -51,6 +51,17 @@ components/
 src/components/
 webS/server.mjs
 ```
+
+## Screenshots
+
+> If the images below don't render on your viewer, use the links under them.
+
+![Screenshot 1](https://ibb.co/qYXdGjxD)
+
+![Screenshot 2](https://ibb.co/9m2hQ3Zb)
+
+- https://ibb.co/qYXdGjxD
+- https://ibb.co/9m2hQ3Zb
 
 ## License
 MIT
