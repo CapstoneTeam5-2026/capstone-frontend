@@ -56,12 +56,11 @@ webS/server.mjs
 
 > If the images below don't render on your viewer, use the links under them.
 
-![Screenshot 1](https://i.ibb.co/RTZ9nb7g/not-so-working-map.png)
+![Screenshot 1](assets/screenshots/not-so-working-map.png)
 
-![Screenshot 2](https://i.ibb.co/0pZKHVsC/working-map.png)
+![Screenshot 2](assets/screenshots/working-map.png)
 
-- https://i.ibb.co/RTZ9nb7g/not-so-working-map.png
-- https://i.ibb.co/0pZKHVsC/working-map.png
+
 
 ## License
 MIT
