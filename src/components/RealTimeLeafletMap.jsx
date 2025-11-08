@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 
-
 /**
  * @typedef {{ id: string, lat: number, lng: number, popup?: string }} TrainUpdate
  */
@@ -19,7 +18,6 @@ const LEAFLET_CSS = `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/leaflet.c
 const LEAFLET_JS = `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/leaflet.js`
 const ICON_BASE = `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/images/`
 
-
 function easeInOutQuad(t) {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t
 }
@@ -29,7 +27,7 @@ export default function RealTimeLeafletMap() {
   const [status, setStatus] = useState("disconnected")
   const containerRef = useRef(null)
   const mapRef = useRef(null)
-  const markersRef = useRef(new Map()) 
+  const markersRef = useRef(new Map())
   const animationsRef = useRef(new Map())
   const pathsRef = useRef(new Map()) // id -> { polyline, coords: L.LatLng[] }
   const MAX_PATH_POINTS = 500
@@ -42,12 +40,13 @@ export default function RealTimeLeafletMap() {
   const selectedTrainIdRef = useRef(null)
   useEffect(() => { selectedTrainIdRef.current = selectedTrainId }, [selectedTrainId])
   const startPositionsRef = useRef(new Map())
-  const lastSamplesRef = useRef(new Map()) 
-  const speedsRef = useRef(new Map()) 
-  const geocodeCacheRef = useRef(new Map()) 
-  const geocodePendingRef = useRef(new Map()) 
+  const lastSamplesRef = useRef(new Map())
+  const speedsRef = useRef(new Map())
+  const geocodeCacheRef = useRef(new Map())
+  const geocodePendingRef = useRef(new Map())
   const [infoTick, setInfoTick] = useState(0)
   const [geoTick, setGeoTick] = useState(0)
+  const [wsUrl, setWsUrl] = useState(null)
 
   useEffect(() => {
     if (!document.getElementById(LEAFLET_CSS_ID)) {
@@ -169,41 +168,181 @@ export default function RealTimeLeafletMap() {
   }, [center])
 
   useEffect(() => {
-    const wsUrl = "ws://localhost:8080"
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
-
-    ws.addEventListener("open", () => setStatus("connected"))
-    ws.addEventListener("close", () => setStatus("disconnected"))
-    ws.addEventListener("error", () => setStatus("disconnected"))
-
-    ws.addEventListener("message", (event) => {
+    const rawEnv =
+      typeof window !== "undefined"
+        ? process.env.NEXT_PUBLIC_WS_URL ?? null
+        : process.env?.NEXT_PUBLIC_WS_URL ?? null;
+  
+    let resolvedUrl = "";
+  
+    if (rawEnv) {
       try {
-        const data = JSON.parse(event.data)
-        /** @type {TrainUpdate[]} */
-        const updates = Array.isArray(data) ? data : [data]
-        applyUpdates(updates)
-      } catch (e) {
-        console.warn("Invalid WS message:", e)
+        const u = new URL(rawEnv, window?.location?.href ?? undefined);
+        resolvedUrl = u.toString();
+      } catch {
+        resolvedUrl = rawEnv;
       }
-    })
+    } else if (typeof window !== "undefined" && window.location) {
 
-    return () => {
-      try {
-        ws.close()
-      } catch {}
-      wsRef.current = null
+      const isDev = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+      if (isDev) {
+        resolvedUrl = "ws://139.59.12.175:8000";
+      } else {
+        const loc = window.location;
+        const proto = loc.protocol === "https:" ? "wss:" : "ws:";
+        resolvedUrl = `${proto}//${loc.hostname}:8000`;
+      }
+    } else {
+      // Fallback to local backend
+      resolvedUrl = "ws://139.59.12.175:8000";
     }
-  }, [])
+  
+    try {
+      // expose for debugging in dev
+      window.__WS_RESOLVED__ = resolvedUrl;
+      // Set the WebSocket URL for display (client-side only)
+      setWsUrl(resolvedUrl);
+    } catch {}
+  
+    let ws = null;
+    let shouldStop = false;
+    let reconnectAttempts = 0;
+    const MAX_BACKOFF = 30000;
+  
+    const makeBackoff = (attempt) => {
+      const base = Math.min(MAX_BACKOFF, 1000 * Math.pow(1.6, attempt));
+      const jitter = Math.random() * 300;
+      return Math.floor(base + jitter);
+    };
+  
+    // Heartbeat setup
+    let lastPongTs = Date.now();
+    const HEARTBEAT_INTERVAL = 15000;
+    let heartbeatTimer = null;
+  
+    function startHeartbeat() {
+      stopHeartbeat();
+      heartbeatTimer = setInterval(() => {
+        try {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ping" }));
+            if (Date.now() - lastPongTs > HEARTBEAT_INTERVAL * 3) {
+              try {
+                ws.close();
+              } catch {}
+            }
+          }
+        } catch {}
+      }, HEARTBEAT_INTERVAL);
+    }
+  
+    function stopHeartbeat() {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  
+    function connect() {
+      reconnectAttempts++;
+      try {
+        ws = new WebSocket(resolvedUrl);
+        wsRef.current = ws;
+      } catch (e) {
+        scheduleReconnect();
+        return;
+      }
+  
+      ws.addEventListener("open", () => {
+        reconnectAttempts = 0;
+        setStatus("connected");
+        lastPongTs = Date.now();
+        startHeartbeat();
+      });
+  
+      ws.addEventListener("message", (event) => {
+        // parse once
+        let parsed = null;
+        try {
+          parsed = JSON.parse(event.data);
+        } catch {
+          parsed = null;
+        }
+  
+        // heartbeat/pong handling
+        if (parsed && (parsed.type === "pong" || parsed.type === "heartbeat")) {
+          lastPongTs = Date.now();
+          return;
+        }
+
+        // normal updates
+        try {
+          const data = parsed ?? JSON.parse(event.data);
+          const updates = Array.isArray(data) ? data : [data];
+          applyUpdates(updates);
+        } catch {
+          console.warn("WS received non-JSON message:", event.data);
+        }
+      });
+  
+      ws.addEventListener("close", () => {
+        setStatus("disconnected");
+        stopHeartbeat();
+        wsRef.current = null;
+        if (!shouldStop) scheduleReconnect();
+      });
+  
+      ws.addEventListener("error", () => {
+        setStatus("disconnected");
+      });
+    }
+  
+    let reconnectTimer = null;
+    function scheduleReconnect() {
+      if (shouldStop) return;
+      const backoff = makeBackoff(reconnectAttempts);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => connect(), backoff);
+    }
+  
+    connect();
+  
+    // Cleanup on unmount
+    return () => {
+      shouldStop = true;
+      stopHeartbeat();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try {
+        ws?.close();
+      } catch {}
+      wsRef.current = null;
+    };
+  }, []);
+  
+  
 
   function applyUpdates(updates) {
     const L = window.L
     if (!L || !mapRef.current) return
 
     for (const u of updates) {
-      if (!u || typeof u !== "object" || !u.id) continue
-      const { id, lat, lng, popup } = u
+      if (!u || typeof u !== "object") continue
+      
+      // Map backend format to frontend format
+      // Backend sends: train_id, lat, lon, speed, timestamp
+      // Frontend expects: id, lat, lng, popup
+      const id = u.train_id || u.id
+      const lat = u.lat
+      const lng = u.lon || u.lng
+      const speed = u.speed
+      const timestamp = u.timestamp
+      const popup = u.popup
+      
+      if (!id) continue
       if (typeof lat !== "number" || typeof lng !== "number" || Number.isNaN(lat) || Number.isNaN(lng)) continue
+      
+      // Use backend speed if available
+      if (typeof speed === "number" && !Number.isNaN(speed)) {
+        speedsRef.current.set(id, speed)
+      }
 
       const existing = markersRef.current.get(id)
       if (!existing) {
@@ -232,19 +371,26 @@ export default function RealTimeLeafletMap() {
           }
         } catch {}
         try {
-          lastSamplesRef.current.set(id, { lat, lng, t: performance.now() })
+          // Use timestamp from backend if available, otherwise use performance.now()
+          const t = timestamp ? timestamp : performance.now()
+          lastSamplesRef.current.set(id, { lat, lng, t })
         } catch {}
       } else {
         try {
-          const now = performance.now()
-          const prev = lastSamplesRef.current.get(id)
-          if (prev && mapRef.current) {
-            const dist = mapRef.current.distance(L.latLng(prev.lat, prev.lng), L.latLng(lat, lng))
-            const dt = Math.max(0.001, (now - prev.t) / 1000)
-            const speedKmh = (dist * 3.6) / dt
-            speedsRef.current.set(id, speedKmh)
+          // If speed wasn't provided by backend, calculate from position changes
+          if (typeof speed !== "number" || Number.isNaN(speed)) {
+            const now = timestamp ? timestamp : performance.now()
+            const prev = lastSamplesRef.current.get(id)
+            if (prev && mapRef.current) {
+              const dist = mapRef.current.distance(L.latLng(prev.lat, prev.lng), L.latLng(lat, lng))
+              const dt = Math.max(0.001, (now - prev.t) / 1000)
+              const speedKmh = (dist * 3.6) / dt
+              speedsRef.current.set(id, speedKmh)
+            }
           }
-          lastSamplesRef.current.set(id, { lat, lng, t: performance.now() })
+          // Use timestamp from backend if available, otherwise use performance.now()
+          const t = timestamp ? timestamp : performance.now()
+          lastSamplesRef.current.set(id, { lat, lng, t })
         } catch {}
         try {
           if (!startPositionsRef.current.has(id)) {
@@ -332,7 +478,7 @@ export default function RealTimeLeafletMap() {
     return () => { try { delete window.selectTrain } catch {} }
   }, [])
 
-  // Resret view
+  // reset to india on escape key
   useEffect(() => {
     function resetToIndia() {
       const map = mapRef.current
@@ -487,7 +633,6 @@ export default function RealTimeLeafletMap() {
     return { id, speedText, startText, currText, startRaw, currRaw }
   }
 
-
   const statusDotClass = status === "connected" ? "bg-green-500" : "bg-red-500"
 
   return (
@@ -549,7 +694,7 @@ export default function RealTimeLeafletMap() {
       </div>
 
       <p className="mt-2 text-xs text-gray-500">
-        Connect a WebSocket server at ws://localhost:8080 to stream train updates.
+        WebSocket: {wsUrl ?? process.env.NEXT_PUBLIC_WS_URL ?? "connecting..."}
       </p>
     </section>
   )
