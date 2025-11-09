@@ -30,9 +30,11 @@ export default function RealTimeLeafletMap() {
   const markersRef = useRef(new Map())
   const animationsRef = useRef(new Map())
   const pathsRef = useRef(new Map()) // id -> { polyline, coords: L.LatLng[] }
+  const pendingUpdatesRef = useRef(new Map()) // id -> latest update data
   const MAX_PATH_POINTS = 500
   const MIN_SEGMENT_METERS = 5
   const isZoomingRef = useRef(false)
+  const isPanningRef = useRef(false)
   const FOLLOW_PADDING_PX = 100
   const canvasRendererRef = useRef(null)
   const wsRef = useRef(null)
@@ -126,10 +128,18 @@ export default function RealTimeLeafletMap() {
           }
         })
         animationsRef.current.clear()
+        // Clear pending updates - we'll queue new ones during zoom
+        pendingUpdatesRef.current.clear()
       })
 
       map.on("zoomend", () => {
         isZoomingRef.current = false
+        // Apply all pending updates immediately after zoom ends
+        if (pendingUpdatesRef.current.size > 0) {
+          const pending = Array.from(pendingUpdatesRef.current.values())
+          pendingUpdatesRef.current.clear()
+          applyUpdatesImmediate(pending)
+        }
         // click center event
         try {
           const selId = selectedTrainIdRef.current
@@ -142,6 +152,29 @@ export default function RealTimeLeafletMap() {
           }
           nudgeMap(map)
         } catch {}
+      })
+
+      map.on("movestart", () => {
+        isPanningRef.current = true
+        // Cancel all marker animations when panning starts
+        animationsRef.current.forEach((cancel) => {
+          if (typeof cancel === "function") {
+            try { cancel() } catch {}
+          }
+        })
+        animationsRef.current.clear()
+        // Clear pending updates - we'll queue new ones during pan
+        pendingUpdatesRef.current.clear()
+      })
+
+      map.on("moveend", () => {
+        isPanningRef.current = false
+        // Apply all pending updates immediately after pan ends
+        if (pendingUpdatesRef.current.size > 0) {
+          const pending = Array.from(pendingUpdatesRef.current.values())
+          pendingUpdatesRef.current.clear()
+          applyUpdatesImmediate(pending)
+        }
       })
     }
 
@@ -319,9 +352,129 @@ export default function RealTimeLeafletMap() {
   
   
 
+  function applyUpdatesImmediate(updates) {
+    const L = window.L
+    if (!L || !mapRef.current) return
+
+    for (const u of updates) {
+      if (!u || typeof u !== "object") continue
+      
+      // Map backend format to frontend format
+      // Backend sends: train_id, lat, lon, speed, timestamp
+      // Frontend expects: id, lat, lng, popup
+      const id = u.train_id || u.id
+      const lat = u.lat
+      const lng = u.lon || u.lng
+      const speed = u.speed
+      const timestamp = u.timestamp
+      const popup = u.popup
+      
+      if (!id) continue
+      if (typeof lat !== "number" || typeof lng !== "number" || Number.isNaN(lat) || Number.isNaN(lng)) continue
+      
+      // Use backend speed if available
+      if (typeof speed === "number" && !Number.isNaN(speed)) {
+        speedsRef.current.set(id, speed)
+      }
+
+      const existing = markersRef.current.get(id)
+      if (!existing) {
+        const m = L.circleMarker([lat, lng], {
+          radius: 5,
+          color: "#16a34a",
+          weight: 2,
+          fill: true,
+          fillColor: "#16a34a",
+          fillOpacity: 1,
+          updateWhenZooming: true,
+          updateWhenDragging: true,
+          renderer: canvasRendererRef.current || undefined,
+        }).addTo(mapRef.current)
+        try {
+          m.on("click", () => {
+            setSelectedTrainId(id)
+          })
+        } catch {}
+        if (popup) { try { m.bindPopup(popup) } catch {} }
+        markersRef.current.set(id, m)
+        ensurePathInitialized(id, [lat, lng])
+        try {
+          if (!startPositionsRef.current.has(id)) {
+            startPositionsRef.current.set(id, L.latLng(lat, lng))
+          }
+        } catch {}
+        try {
+          // Use timestamp from backend if available, otherwise use performance.now()
+          const t = timestamp ? timestamp : performance.now()
+          lastSamplesRef.current.set(id, { lat, lng, t })
+        } catch {}
+      } else {
+        try {
+          // If speed wasn't provided by backend, calculate from position changes
+          if (typeof speed !== "number" || Number.isNaN(speed)) {
+            const now = timestamp ? timestamp : performance.now()
+            const prev = lastSamplesRef.current.get(id)
+            if (prev && mapRef.current) {
+              const dist = mapRef.current.distance(L.latLng(prev.lat, prev.lng), L.latLng(lat, lng))
+              const dt = Math.max(0.001, (now - prev.t) / 1000)
+              const speedKmh = (dist * 3.6) / dt
+              speedsRef.current.set(id, speedKmh)
+            }
+          }
+          // Use timestamp from backend if available, otherwise use performance.now()
+          const t = timestamp ? timestamp : performance.now()
+          lastSamplesRef.current.set(id, { lat, lng, t })
+        } catch {}
+        try {
+          if (!startPositionsRef.current.has(id)) {
+            startPositionsRef.current.set(id, L.latLng(lat, lng))
+          }
+        } catch {}
+        // Cancel any existing animation
+        const cancel = animationsRef.current.get(id)
+        if (typeof cancel === "function") {
+          try { cancel() } catch {}
+        }
+        // Immediately update marker position (no animation)
+        existing.setLatLng([lat, lng])
+        if (popup) { try { existing.bindPopup(popup) } catch {} }
+        appendToPath(id, [lat, lng])
+
+        // click center event
+        if (selectedTrainIdRef.current === id && !isZoomingRef.current && !isPanningRef.current) {
+          try {
+            const map = mapRef.current
+            if (map) {
+              const target = window.L.latLng(lat, lng)
+              const needsPan = !isPointWithinViewport(map, target, FOLLOW_PADDING_PX)
+              if (needsPan) {
+                isPanningRef.current = true
+                map.panTo(target, { animate: true, duration: 0.25, easeLinearity: 0.2, noMoveStart: true })
+              }
+              setInfoTick((n) => n + 1)
+            }
+          } catch {}
+        }
+      }
+    }
+  }
+
   function applyUpdates(updates) {
     const L = window.L
     if (!L || !mapRef.current) return
+
+    // If zooming or panning, queue updates instead of applying them
+    if (isZoomingRef.current || isPanningRef.current) {
+      for (const u of updates) {
+        if (!u || typeof u !== "object") continue
+        const id = u.train_id || u.id
+        if (id) {
+          // Store the latest update for each train
+          pendingUpdatesRef.current.set(id, u)
+        }
+      }
+      return
+    }
 
     for (const u of updates) {
       if (!u || typeof u !== "object") continue
@@ -405,7 +558,7 @@ export default function RealTimeLeafletMap() {
         const dLat = Math.abs(current.lat - lat)
         const dLng = Math.abs(current.lng - lng)
         const tinyMove = dLat < 0.00005 && dLng < 0.00005
-        if (tinyMove || isZoomingRef.current) {
+        if (tinyMove || isZoomingRef.current || isPanningRef.current) {
           existing.setLatLng([lat, lng])
         } else {
           const cancelNew = animateMarker(existing, [lat, lng])
@@ -415,13 +568,14 @@ export default function RealTimeLeafletMap() {
         appendToPath(id, [lat, lng])
 
         // click center event
-        if (selectedTrainIdRef.current === id && !isZoomingRef.current) {
+        if (selectedTrainIdRef.current === id && !isZoomingRef.current && !isPanningRef.current) {
           try {
             const map = mapRef.current
             if (map) {
               const target = window.L.latLng(lat, lng)
               const needsPan = !isPointWithinViewport(map, target, FOLLOW_PADDING_PX)
               if (needsPan) {
+                isPanningRef.current = true
                 map.panTo(target, { animate: true, duration: 0.25, easeLinearity: 0.2, noMoveStart: true })
               }
               setInfoTick((n) => n + 1)
@@ -484,6 +638,25 @@ export default function RealTimeLeafletMap() {
       const map = mapRef.current
       if (!map || !window.L) return
       try {
+        // Cancel all animations immediately
+        animationsRef.current.forEach((cancel) => {
+          if (typeof cancel === "function") {
+            try { cancel() } catch {}
+          }
+        })
+        animationsRef.current.clear()
+        
+        // Reset flags first
+        isZoomingRef.current = false
+        isPanningRef.current = false
+        
+        // Apply any pending updates immediately before reset
+        if (pendingUpdatesRef.current.size > 0) {
+          const pending = Array.from(pendingUpdatesRef.current.values())
+          pendingUpdatesRef.current.clear()
+          applyUpdatesImmediate(pending)
+        }
+        
         const bounds = window.L.latLngBounds(INDIA_BOUNDS)
         map.fitBounds(bounds, { padding: [20, 20], maxZoom: 6, animate: false })
         setSelectedTrainId(null)
