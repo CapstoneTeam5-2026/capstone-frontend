@@ -14,17 +14,18 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" className="dark">
       <head>
         <style>{`
 html {
   font-family: ${GeistSans.style.fontFamily};
   --font-sans: ${GeistSans.variable};
+  --font-sans-family: ${GeistSans.style.fontFamily};
   --font-mono: ${GeistMono.variable};
 }
         `}</style>
       </head>
-      <body>
+      <body className="bg-gray-900">
         {children}
         <Analytics />
       </body>
