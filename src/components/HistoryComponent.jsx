@@ -66,11 +66,7 @@ export default function HistoryComponent() {
     }
   }
 
-  /**
-   * Detects where the train stopped by analyzing movement patterns.
-   * A stop is detected when the train stays in roughly the same location
-   * (moves less than 20 meters) for at least 5 minutes, or moves slower than 0.5 km/h.
-   */
+
   function detectStops(points) {
     const STOP_SECONDS = 300
     const MAX_SPEED = 0.5
