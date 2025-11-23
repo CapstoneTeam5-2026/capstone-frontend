@@ -35,7 +35,7 @@ export default function HistoryComponent() {
     return () => { try { map.remove() } catch {} }
   }, [leafletLoaded])
 
-  // --- API call (placeholder) ---
+  // --- API call to FastAPI backend ---
   async function fetchHistory(id, from, to) {
     setLoading(true)
     setError(null)
@@ -46,8 +46,13 @@ export default function HistoryComponent() {
       if (from) q.set("from", from)
       if (to) q.set("to", to)
 
-      const res = await fetch(`/api/history?${q.toString()}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      // Use environment variable or default to FastAPI server on port 8000
+      const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const res = await fetch(`${apiBaseUrl}/api/history?${q.toString()}`)
+      if (!res.ok) {
+        const errorText = await res.text()
+        throw new Error(`HTTP ${res.status}: ${errorText || "Server error"}`)
+      }
 
       const arr = await res.json()
       // API returns array of location points: [{ lat, lng, timestamp(ms), speed? }, ...] in chronological order
@@ -178,6 +183,38 @@ export default function HistoryComponent() {
     const local = new Date(date.getTime() - tzOffset)
     return local.toISOString().slice(0, 16)
   }
+
+  function resetForm() {
+    setTrainId("")
+    setFromIso("")
+    setToIso("")
+    setError(null)
+    setInfoText("Enter train id + optional range, then Load.")
+    if (polyRef.current) try { polyRef.current.remove() } catch {}
+    if (stopsLayerRef.current) try { stopsLayerRef.current.clearLayers() } catch {}
+    if (mapRef.current) try { mapRef.current.setView([20.5937, 78.9629], 5) } catch {}
+  }
+
+  // Escape key handler to reset map to default position
+  useEffect(() => {
+    function handleEscape(e) {
+      // Only handle if not typing in an input
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return
+      if (e.key === "Escape" || e.keyCode === 27) {
+        const map = mapRef.current
+        if (map) {
+          try {
+            // Reset map to default position (India center, zoom 5)
+            map.setView([20.5937, 78.9629], 5, { animate: true })
+            e.preventDefault()
+          } catch {}
+        }
+      }
+    }
+    document.addEventListener("keydown", handleEscape)
+    return () => document.removeEventListener("keydown", handleEscape)
+  }, [])
+
   return (
     <section className="rounded-lg border border-gray-700 p-4 bg-gray-900 text-gray-100">
       <div className="flex items-center justify-between mb-4 gap-3">
@@ -242,16 +279,7 @@ export default function HistoryComponent() {
           </button>
           <button
             type="button"
-            onClick={() => {
-              setTrainId("")
-              setFromIso("")
-              setToIso("")
-              setError(null)
-              setInfoText("Enter train id + optional range, then Load.")
-              if (polyRef.current) try { polyRef.current.remove() } catch {}
-              if (stopsLayerRef.current) try { stopsLayerRef.current.clearLayers() } catch {}
-              if (mapRef.current) try { mapRef.current.setView([20.5937, 78.9629], 5) } catch {}
-            }}
+            onClick={resetForm}
             className="px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded text-sm font-medium border border-gray-700"
           >
             Reset

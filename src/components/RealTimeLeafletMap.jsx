@@ -29,11 +29,19 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
   const animationsRef = useRef(new Map())
   const lastSamplesRef = useRef(new Map())
   const speedsRef = useRef(new Map())
+  const targetPositionsRef = useRef(new Map())
+  const startLocationsRef = useRef(new Map())
   const wsRef = useRef(null)
 
   const [status, setStatus] = useState("disconnected")
   const [wsUrl, setWsUrl] = useState(null)
   const [selectedTrainId, setSelectedTrainId] = useState(null)
+  const [selectedTrainDetails, setSelectedTrainDetails] = useState(null)
+  const [searchQuery, setSearchQuery] = useState("")
+  const [availableTrainIds, setAvailableTrainIds] = useState([])
+  const [currentPlaceName, setCurrentPlaceName] = useState(null)
+  const [startPlaceName, setStartPlaceName] = useState(null)
+  const geocodingCacheRef = useRef(new Map())
 
   const MAX_PATH_POINTS = 500
   const MIN_SEGMENT_METERS = 5
@@ -98,8 +106,9 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
         map.fitBounds(bounds, { padding: [20, 20], maxZoom: 6, animate: false })
       } catch {}
 
-      map.on("zoomstart", () => { cancelAllAnimations(); pendingRef.current.clear() })
-      map.on("movestart", () => { cancelAllAnimations(); pendingRef.current.clear() })
+      map.on("zoomstart", () => { cancelAllAnimations(true) })
+      map.on("movestart", () => { cancelAllAnimations(true) })
+      map.on("zoomend", () => { updateMarkerSizes() })
     }
 
     return () => {
@@ -119,9 +128,9 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
       resolved = (typeof window !== "undefined" && process.env.NEXT_PUBLIC_WS_URL) || null
       if (!resolved && typeof window !== "undefined") {
         const isDev = ["localhost", "127.0.0.1"].includes(window.location.hostname)
-        resolved = isDev ? "ws://localhost:8000" : (window.location.protocol === "https:" ? `wss://${window.location.hostname}:8000` : `ws://${window.location.hostname}:8000`)
+        resolved = isDev ? "ws://localhost:8080" : (window.location.protocol === "https:" ? `wss://${window.location.hostname}:8080` : `ws://${window.location.hostname}:8080`)
       }
-    } catch { resolved = "ws://localhost:8000" }
+    } catch { resolved = "ws://localhost:8080" }
     setWsUrl(resolved)
     window.__WS_RESOLVED__ = resolved
 
@@ -226,8 +235,11 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
 
       let marker = markersRef.current.get(id)
       if (!marker) {
+        const zoom = map.getZoom()
+        const baseRadius = 5
+        const radius = Math.max(3, Math.min(12, baseRadius + (zoom - 5) * 0.5))
         marker = L.circleMarker([lat, lng], {
-          radius: 5,
+          radius,
           color: "#16a34a",
           weight: 2,
           fill: true,
@@ -235,12 +247,25 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
           fillOpacity: 1,
           renderer: canvasRendererRef.current || undefined,
         }).addTo(map)
-        try { marker.on("click", () => setSelectedTrainId(id)) } catch {}
+        try { 
+          marker.on("click", () => {
+            setSelectedTrainId(id)
+            // Center on train marker
+            setTimeout(() => {
+              centerOnTrain(id)
+            }, 50)
+          })
+        } catch {}
         if (u.popup) try { marker.bindPopup(u.popup) } catch {}
 
         markersRef.current.set(id, marker)
-        ensurePathInitialized(id, [lat, lng])
+        ensurePathInitialized(id, [[lat, lng]])
         lastSamplesRef.current.set(id, { lat, lng, t: timestamp })
+        targetPositionsRef.current.set(id, [lat, lng])
+        // Store start location
+        if (!startLocationsRef.current.has(id)) {
+          startLocationsRef.current.set(id, { lat, lng })
+        }
       } else {
         if (typeof speed !== "number" || Number.isNaN(speed)) {
           try {
@@ -260,6 +285,7 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
 
         const cancel = animationsRef.current.get(id)
         if (typeof cancel === "function") try { cancel() } catch {}
+        targetPositionsRef.current.set(id, [lat, lng])
         const cur = marker.getLatLng()
         const dLat = Math.abs(cur.lat - lat)
         const dLng = Math.abs(cur.lng - lng)
@@ -293,11 +319,33 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
     animationsRef.current.delete(id)
     speedsRef.current.delete(id)
     lastSamplesRef.current.delete(id)
+    targetPositionsRef.current.delete(id)
+    startLocationsRef.current.delete(id)
   }
 
-  function cancelAllAnimations() {
+  function cancelAllAnimations(immediate = false) {
     animationsRef.current.forEach((c) => { if (typeof c === "function") try { c() } catch {} })
     animationsRef.current.clear()
+    if (immediate) {
+      // Set markers to their target positions immediately
+      targetPositionsRef.current.forEach(([lat, lng], id) => {
+        const marker = markersRef.current.get(id)
+        if (marker) {
+          try { marker.setLatLng([lat, lng]) } catch {}
+        }
+      })
+    }
+  }
+
+  function updateMarkerSizes() {
+    const map = mapRef.current
+    if (!map) return
+    const zoom = map.getZoom()
+    const baseRadius = 5
+    const radius = Math.max(3, Math.min(12, baseRadius + (zoom - 5) * 0.5))
+    markersRef.current.forEach((marker) => {
+      try { marker.setRadius(radius) } catch {}
+    })
   }
 
   function ensurePathInitialized(id, latLngArray) {
@@ -306,6 +354,11 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
     if (!map || !L) return
     if (pathsRef.current.has(id)) return
     const coords = latLngArray.map((p) => L.latLng(p[0], p[1]))
+    // Need at least 2 points for a visible line
+    if (coords.length < 2) {
+      // Duplicate the point to create a visible segment
+      coords.push(L.latLng(coords[0].lat, coords[0].lng))
+    }
     const polyline = L.polyline(coords, {
       color: "#16a34a",
       weight: 2,
@@ -319,15 +372,27 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
     const L = window.L
     const map = mapRef.current
     if (!map || !L) return
-    if (!pathsRef.current.has(id)) { ensurePathInitialized(id, [latLng]); return }
+    if (!pathsRef.current.has(id)) { 
+      ensurePathInitialized(id, [[latLng[0], latLng[1]]])
+      return 
+    }
     const entry = pathsRef.current.get(id)
+    if (!entry || !entry.coords || entry.coords.length === 0) {
+      ensurePathInitialized(id, [[latLng[0], latLng[1]]])
+      return
+    }
     const next = L.latLng(latLng[0], latLng[1])
     const prev = entry.coords[entry.coords.length - 1]
     const distance = map.distance(prev, next)
     if (distance < MIN_SEGMENT_METERS) return
     entry.coords.push(next)
     if (entry.coords.length > MAX_PATH_POINTS) entry.coords.splice(0, entry.coords.length - MAX_PATH_POINTS)
-    try { entry.polyline.setLatLngs(entry.coords) } catch { entry.polyline.setLatLngs(entry.coords) }
+    try { 
+      entry.polyline.setLatLngs(entry.coords) 
+      entry.polyline.redraw()
+    } catch (e) { 
+      try { entry.polyline.setLatLngs(entry.coords) } catch {}
+    }
   }
 
   function animateMarker(marker, [lat, lng]) {
@@ -337,29 +402,297 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
     const deltaLat = Math.abs(end.lat - start.lat)
     const deltaLng = Math.abs(end.lng - start.lng)
     const distance = Math.sqrt(deltaLat * deltaLat + deltaLng * deltaLng)
-    const duration = Math.min(600, Math.max(150, distance * 6000))
+    // Cap duration to prevent very long animations
+    const duration = Math.min(1000, Math.max(100, distance * 4000))
     const t0 = performance.now()
     let raf = null
+    let cancelled = false
     function step(now) {
+      if (cancelled) return
       const elapsed = now - t0
       const t = Math.min(1, elapsed / duration)
       const k = easeInOutQuad(t)
       const latv = start.lat + (end.lat - start.lat) * k
       const lngv = start.lng + (end.lng - start.lng) * k
-      marker.setLatLng([latv, lngv])
-      if (t < 1) raf = requestAnimationFrame(step)
+      try {
+        marker.setLatLng([latv, lngv])
+      } catch {}
+      if (t < 1 && !cancelled) {
+        raf = requestAnimationFrame(step)
+      } else if (t >= 1) {
+        // Ensure final position is set
+        try { marker.setLatLng([lat, lng]) } catch {}
+      }
     }
     raf = requestAnimationFrame(step)
-    return () => { if (raf) cancelAnimationFrame(raf) }
+    return () => { 
+      cancelled = true
+      if (raf) cancelAnimationFrame(raf)
+    }
   }
 
   const statusDot = status === "connected" ? "bg-green-500" : "bg-red-500"
+
+  // Helper function to center map on a train marker
+  function centerOnTrain(trainId) {
+    const map = mapRef.current
+    if (!map || !window.L || !trainId) return
+    
+    // Try to get the marker's current position first (most accurate)
+    const marker = markersRef.current.get(trainId)
+    let pos = null
+    
+    if (marker) {
+      try {
+        const latLng = marker.getLatLng()
+        if (latLng && typeof latLng.lat === 'number' && typeof latLng.lng === 'number') {
+          pos = [latLng.lat, latLng.lng]
+        }
+      } catch {}
+    }
+    
+    // Fallback to target position if marker position not available
+    if (!pos) {
+      pos = targetPositionsRef.current.get(trainId)
+    }
+    
+    // Validate position before centering
+    if (pos && Array.isArray(pos) && pos.length >= 2 && 
+        typeof pos[0] === 'number' && typeof pos[1] === 'number' &&
+        !isNaN(pos[0]) && !isNaN(pos[1]) &&
+        pos[0] >= -90 && pos[0] <= 90 && pos[1] >= -180 && pos[1] <= 180) {
+      try {
+        const currentZoom = map.getZoom()
+        const targetZoom = Math.max(currentZoom, 12)
+        // Center the map on the marker position
+        map.setView([pos[0], pos[1]], targetZoom, { animate: true, duration: 0.5 })
+      } catch {}
+    }
+  }
+
+  // Update selected train details and center on train when selected
+  useEffect(() => {
+    if (!selectedTrainId) {
+      setSelectedTrainDetails(null)
+      setCurrentPlaceName(null)
+      setStartPlaceName(null)
+      return
+    }
+    
+    // Center on selected train marker with retry mechanism
+    let attempts = 0
+    const maxAttempts = 5
+    const tryCenter = () => {
+      attempts++
+      const marker = markersRef.current.get(selectedTrainId)
+      const pos = targetPositionsRef.current.get(selectedTrainId)
+      
+      if (marker || pos) {
+        centerOnTrain(selectedTrainId)
+      } else if (attempts < maxAttempts) {
+        setTimeout(tryCenter, 150)
+      }
+    }
+    setTimeout(tryCenter, 200)
+    
+    let lastCurrentPos = null
+    let lastStartLoc = null
+    let geocodeTimeout = null
+    
+    async function fetchCityNames(currentPosData, startLoc) {
+      // Fetch current position city name
+      if (currentPosData && (!lastCurrentPos || 
+          Math.abs(currentPosData.lat - lastCurrentPos.lat) > 0.01 || 
+          Math.abs(currentPosData.lng - lastCurrentPos.lng) > 0.01)) {
+        const cityName = await getPlaceName(currentPosData.lat, currentPosData.lng)
+        if (cityName) setCurrentPlaceName(cityName)
+        lastCurrentPos = currentPosData
+      }
+      
+      // Fetch start location city name
+      if (startLoc && (!lastStartLoc || 
+          Math.abs(startLoc.lat - lastStartLoc.lat) > 0.01 || 
+          Math.abs(startLoc.lng - lastStartLoc.lng) > 0.01)) {
+        const cityName = await getPlaceName(startLoc.lat, startLoc.lng)
+        if (cityName) setStartPlaceName(cityName)
+        lastStartLoc = startLoc
+      }
+    }
+    
+    function updateDetails() {
+      const marker = markersRef.current.get(selectedTrainId)
+      const speed = speedsRef.current.get(selectedTrainId)
+      const targetPos = targetPositionsRef.current.get(selectedTrainId)
+      const startLoc = startLocationsRef.current.get(selectedTrainId)
+      const currentPos = marker ? marker.getLatLng() : null
+      
+      const currentPosData = currentPos ? { lat: currentPos.lat, lng: currentPos.lng } : (targetPos ? { lat: targetPos[0], lng: targetPos[1] } : null)
+      
+      setSelectedTrainDetails({
+        currentPos: currentPosData,
+        speed,
+        startLoc,
+      })
+      
+      // Fetch place names when coordinates change (with debouncing for updates)
+      if (geocodeTimeout) clearTimeout(geocodeTimeout)
+      geocodeTimeout = setTimeout(() => {
+        fetchCityNames(currentPosData, startLoc)
+      }, 2000) // Debounce geocoding by 2 seconds for updates
+    }
+    
+    // Initial fetch of city names immediately when train is selected
+    const marker = markersRef.current.get(selectedTrainId)
+    const targetPos = targetPositionsRef.current.get(selectedTrainId)
+    const startLoc = startLocationsRef.current.get(selectedTrainId)
+    const currentPos = marker ? marker.getLatLng() : null
+    const currentPosData = currentPos ? { lat: currentPos.lat, lng: currentPos.lng } : (targetPos ? { lat: targetPos[0], lng: targetPos[1] } : null)
+    
+    // Fetch city names immediately
+    fetchCityNames(currentPosData, startLoc)
+    
+    updateDetails()
+    const interval = setInterval(updateDetails, 500)
+    return () => {
+      clearInterval(interval)
+      if (geocodeTimeout) clearTimeout(geocodeTimeout)
+    }
+  }, [selectedTrainId])
 
   // expose selectTrain for debugging
   useEffect(() => {
     if (typeof window === "undefined") return
     window.selectTrain = (id) => setSelectedTrainId(id)
     return () => { try { delete window.selectTrain } catch {} }
+  }, [])
+
+  // Update available train IDs for search
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const trainIds = Array.from(markersRef.current.keys())
+      setAvailableTrainIds(trainIds.sort())
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Function to select train from search
+  function selectTrainFromSearch(trainId) {
+    setSelectedTrainId(trainId)
+    setSearchQuery("")
+    
+    // Force centering with multiple attempts to ensure it works
+    // First attempt immediately after state update
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        centerOnTrain(trainId)
+        
+        // Retry a few times in case marker isn't ready yet
+        let attempts = 0
+        const maxAttempts = 3
+        const retryInterval = setInterval(() => {
+          attempts++
+          const marker = markersRef.current.get(trainId)
+          const pos = targetPositionsRef.current.get(trainId)
+          
+          if (marker || pos) {
+            centerOnTrain(trainId)
+            clearInterval(retryInterval)
+          } else if (attempts >= maxAttempts) {
+            clearInterval(retryInterval)
+          }
+        }, 200)
+      }, 100)
+    })
+  }
+
+  // Reverse geocoding function to get city name from coordinates
+  async function getPlaceName(lat, lng) {
+    if (!lat || !lng) return null
+    
+    // Round to 4 decimal places for caching (about 11 meters precision)
+    const cacheKey = `${lat.toFixed(4)},${lng.toFixed(4)}`
+    if (geocodingCacheRef.current.has(cacheKey)) {
+      return geocodingCacheRef.current.get(cacheKey)
+    }
+
+    try {
+      // Use Nominatim reverse geocoding API (free, no API key required)
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=10&addressdetails=1`,
+        {
+          headers: {
+            'User-Agent': 'TrainTracker/1.0' // Required by Nominatim
+          }
+        }
+      )
+      
+      if (!response.ok) return null
+      
+      const data = await response.json()
+      let cityName = null
+      
+      if (data.address) {
+        // Prioritize city name, with fallbacks
+        cityName = data.address.city || 
+                   data.address.town || 
+                   data.address.municipality ||
+                   data.address.village || 
+                   data.address.county || 
+                   data.address.state_district ||
+                   data.address.state
+      }
+      
+      // If no city found in address, try to extract from display_name
+      if (!cityName && data.display_name) {
+        // display_name format is usually: "Name, City, State, Country"
+        const parts = data.display_name.split(',').map(s => s.trim())
+        // Usually city is the second part, but try to find it
+        for (let i = 0; i < Math.min(parts.length, 3); i++) {
+          if (parts[i] && !parts[i].match(/^\d+$/) && parts[i].length > 2) {
+            cityName = parts[i]
+            break
+          }
+        }
+      }
+      
+      if (cityName) {
+        geocodingCacheRef.current.set(cacheKey, cityName)
+        // Limit cache size to prevent memory issues
+        if (geocodingCacheRef.current.size > 100) {
+          const firstKey = geocodingCacheRef.current.keys().next().value
+          geocodingCacheRef.current.delete(firstKey)
+        }
+      }
+      
+      return cityName
+    } catch (error) {
+      console.error('Reverse geocoding error:', error)
+      return null
+    }
+  }
+
+  // Escape key handler to zoom out to default view and unselect train
+  useEffect(() => {
+    function handleEscape(e) {
+      // Only handle if not typing in an input
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return
+      if (e.key === "Escape" || e.keyCode === 27) {
+        // Unselect train
+        setSelectedTrainId(null)
+        
+        // Reset zoom to default view
+        const map = mapRef.current
+        if (map && window.L) {
+          try {
+            const bounds = window.L.latLngBounds(INDIA_BOUNDS)
+            map.fitBounds(bounds, { padding: [20, 20], maxZoom: 6, animate: true })
+            e.preventDefault()
+          } catch {}
+        }
+      }
+    }
+    document.addEventListener("keydown", handleEscape)
+    return () => document.removeEventListener("keydown", handleEscape)
   }, [])
 
   return (
@@ -384,12 +717,89 @@ export default function RealTimeLeafletMap({ onSelectTrain } = {}) {
 
         <aside className="w-full lg:w-80 shrink-0 rounded-md border border-gray-700 p-3 overflow-auto bg-black/20">
           <div className="text-sm">
-            <div className="mb-3">Click a train marker to select it.</div>
-            <div className="font-semibold mb-2">Selected</div>
+            <div className="mb-3">
+              <label className="block text-xs text-gray-400 mb-1.5">Search Train</label>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Type train ID..."
+                className="w-full px-2.5 py-1.5 bg-gray-800 border border-gray-600 rounded text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-green-500 focus:ring-1 focus:ring-green-500"
+              />
+              {searchQuery && (
+                <div className="mt-2 max-h-48 overflow-y-auto border border-gray-700 rounded bg-gray-900">
+                  {availableTrainIds
+                    .filter(id => id.toLowerCase().includes(searchQuery.toLowerCase()))
+                    .slice(0, 10)
+                    .map(id => (
+                      <button
+                        key={id}
+                        onClick={() => selectTrainFromSearch(id)}
+                        className="w-full px-2.5 py-1.5 text-left text-xs hover:bg-gray-800 transition-colors border-b border-gray-800 last:border-b-0"
+                      >
+                        🚆 {id}
+                      </button>
+                    ))}
+                  {availableTrainIds.filter(id => id.toLowerCase().includes(searchQuery.toLowerCase())).length === 0 && (
+                    <div className="px-2.5 py-1.5 text-xs text-gray-500">No trains found</div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="font-semibold mb-2">Selected Train</div>
             {selectedTrainId ? (
               <>
-                <div className="mb-2">Train {selectedTrainId}</div>
-                <button className="rounded bg-gray-700 px-2 py-1 text-xs hover:bg-gray-600" onClick={() => setSelectedTrainId(null)}>Clear</button>
+                <div className="mb-3 space-y-2">
+                  <div className="font-medium text-base">🚆 {selectedTrainId}</div>
+                  
+                  {selectedTrainDetails && (
+                    <div className="space-y-2 text-xs">
+                      {selectedTrainDetails.currentPos && (
+                        <div className="border-t border-gray-700 pt-2">
+                          <div className="text-gray-400 mb-1.5">Current Location</div>
+                          {currentPlaceName ? (
+                            <div className="text-green-400 font-semibold text-sm mb-2">🏙️ {currentPlaceName}</div>
+                          ) : (
+                            <div className="text-gray-500 text-xs mb-2 italic">Loading city name...</div>
+                          )}
+                          <div className="font-mono text-gray-300 text-xs">
+                            <div>Lat: {selectedTrainDetails.currentPos.lat.toFixed(6)}</div>
+                            <div>Lng: {selectedTrainDetails.currentPos.lng.toFixed(6)}</div>
+                          </div>
+                        </div>
+                      )}
+                      
+                      {selectedTrainDetails.speed !== undefined && (
+                        <div className="border-t border-gray-700 pt-2">
+                          <div className="text-gray-400 mb-1">Speed</div>
+                          <div className="text-gray-300 font-medium">{selectedTrainDetails.speed.toFixed(1)} km/h</div>
+                        </div>
+                      )}
+                      
+                      {selectedTrainDetails.startLoc && (
+                        <div className="border-t border-gray-700 pt-2">
+                          <div className="text-gray-400 mb-1.5">Start Location</div>
+                          {startPlaceName ? (
+                            <div className="text-blue-400 font-semibold text-sm mb-2">🏙️ {startPlaceName}</div>
+                          ) : (
+                            <div className="text-gray-500 text-xs mb-2 italic">Loading city name...</div>
+                          )}
+                          <div className="font-mono text-gray-300 text-xs">
+                            <div>Lat: {selectedTrainDetails.startLoc.lat.toFixed(6)}</div>
+                            <div>Lng: {selectedTrainDetails.startLoc.lng.toFixed(6)}</div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+                
+                <button 
+                  className="rounded bg-gray-700 px-3 py-1.5 text-xs hover:bg-gray-600 transition-colors" 
+                  onClick={() => setSelectedTrainId(null)}
+                >
+                  Clear Selection
+                </button>
               </>
             ) : (
               <div className="text-gray-400">No train selected</div>
