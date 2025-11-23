@@ -46,7 +46,6 @@ export default function HistoryComponent() {
       if (from) q.set("from", from)
       if (to) q.set("to", to)
 
-      // Use environment variable or default to FastAPI server on port 8000
       const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
       const res = await fetch(`${apiBaseUrl}/api/history?${q.toString()}`)
       if (!res.ok) {
@@ -55,7 +54,6 @@ export default function HistoryComponent() {
       }
 
       const arr = await res.json()
-      // API returns array of location points: [{ lat, lng, timestamp(ms), speed? }, ...] in chronological order
       if (!Array.isArray(arr) || arr.length === 0) {
         setInfoText("No history points found for this query.")
         renderHistory([])
